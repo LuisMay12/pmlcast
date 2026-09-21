@@ -9,7 +9,7 @@
 | Repository | `github.com/LuisMay12/pmlcast` |
 | Pitch version | 0.5 — September 2, 2026 |
 | Build window | August 31 – September 24, 2026 (3½ weeks, no slack) |
-| Mentor / reviewer | **TBD** (see §11) |
+| Mentor / reviewer | Ricardo Best (see §11) |
 
 ---
 
@@ -25,7 +25,7 @@ Solo project. Luis May owns every area:
 |---|---|
 | Data engineering | CENACE data collection, cleaning, storage (Delta / Parquet), daily refresh job |
 | Modeling | Problem framing, baselines, LSTM model, hyperparameter search, evaluation methodology |
-| MLOps & deployment | MLflow tracking and registry, Databricks Model Serving endpoint, scheduled batch forecasts |
+| MLOps & deployment | MLflow tracking and registry, containerized serving endpoint, scheduled batch forecasts |
 | Product | Dashboard, REST API contract, "best injection window" feature |
 | Quality | Unit tests, CI, reproducibility (seeds, pinned dependencies) |
 | Communication | README, model card, blog post, presentation, demo |
@@ -50,7 +50,7 @@ Concretely, the project will:
 2. Frame day-ahead forecasting as a supervised sequence-to-vector problem (168 hourly inputs → 24 hourly outputs).
 3. Establish honest baselines (naive daily, naive weekly, seasonal moving average, linear regression) and train an **LSTM** conditioned on the node's recent history and its stable CENACE metadata (regional control center as one-hot, voltage level as a number, load zone as an embedding with an UNKNOWN fallback) that must beat them.
 4. Validate with time-based splits, walk-forward backtesting on the last six months, and two held-out regimes — leave-one-node-out (a new node in a load zone seen in training) and leave-one-zone-out (a new node in a zone never seen) — to measure, separately, how well the model generalizes to nodes it has never seen.
-5. Deploy the model on **Databricks** (MLflow registry → Model Serving endpoint), with a daily job that publishes tomorrow's forecast for every tracked node.
+5. Deploy the model as a **containerized FastAPI endpoint** (FastAPI + Docker serving the model from the MLflow registry), with a daily job that publishes tomorrow's forecast for every tracked node. Databricks Model Serving is tried at the end, as an optional extra.
 6. Phase 2, after the MVP: a second model that predicts the 24 hourly **MTR** prices of the next day given the published MDA prices for that day, evaluated against the naive rule *MTR = MDA*.
 
 ### Why this project
@@ -146,7 +146,7 @@ Each response returns, per node, a list of `{fecha, hora (1–24), pml, pml_ene,
 | Stage | Nodes | Purpose | API time |
 |---|---|---|---|
 | 1 (week 1, Sep 2–3) | Peninsular region: one batch of ~20 nodes covering its 8 load zones and 400/230/115 kV levels (the region has 115 nodes); 2022 → today | End-to-end smoke test: collector → bronze → silver → quality report | 240 calls, 10–40 min |
-| 2 (week 1, nights of Sep 3–5) | **~100 SIN nodes**: all 53 × 400 kV nodes (the grid backbone), ~30 × 230 kV and ~17 × 115 kV nodes, with **at least two nodes per regional control center at each of the three voltage levels** and as many load zones as possible; **full MDA history 2016 → today** plus **MTR 2022 → today** | MVP training set; the voltage feature spans 400/230/115 kV instead of extrapolating; MTR ready for Phase 2 | ~2,800 MDA calls + ~1,200 MTR calls, 3–21 h (two or three nights) |
+| 2 (week 1, nights of Sep 3–5) | **~100 SIN nodes**: all 400 kV nodes (the grid backbone: 53 in the August catalog, 52 in the February one), ~30 × 230 kV and ~17 × 115 kV nodes, with **at least two nodes per regional control center at each voltage level where the catalog allows it** (NORTE and PENINSULAR have a single 400 kV node) and as many load zones as possible; **full MDA history 2016 → today** plus **MTR 2022 → today** | MVP training set; the voltage feature spans 400/230/115 kV instead of extrapolating; MTR ready for Phase 2 | ~2,800 MDA calls + ~1,200 MTR calls, 3–21 h (two or three nights) |
 | 3 (optional, only if Stage 2 is done early) | Remaining 230 kV nodes (~180) and more 115 kV nodes, including **whole load zones absent from Stage 2** (held out later for the leave-one-zone-out test); 2022 → today | Better coverage of load zones / voltage levels; full MTR history back to 2017 for the Stage 2 nodes if Phase 2 is reached | 2,400–4,800 calls, 2–25 h |
 
 The minimum viable training set is ~30 nodes (3–5 per region); Stage 2 aims higher because collection is cheap and more nodes make the metadata features learnable. Even so, ~100 nodes cannot cover the 109 load zones: roughly half the zones will have no training node and most of the rest one to three, which shapes how load zone is encoded (§8).
@@ -177,7 +177,8 @@ z_t = (P_t − μ_D) / σ_D
 
 μ_D, σ_D = mean and standard deviation of the node's hourly MDA price over the trailing
            28 days [D−27, D]: 672 hours ending at 23:00 of day D, the last hour of the input window
-σ_D      = max(σ_D, 0.1·|μ_D|, 10 MXN/MWh)          floor against flat weeks and curtailment-heavy nodes
+σ_D      = max(σ_D, 0.05·|μ_D|, 10 MXN/MWh)         floor against degenerate windows (flat weeks, curtailment-heavy
+                                                    nodes); 0.05 so a quiet but normal month (CV ≈ 0.08–0.10) keeps its real σ
 ```
 
 The same `μ_D, σ_D` standardize the 168 input hours, the 24 target hours during training, and invert the prediction at serving time (`P̂ = μ_D + σ_D · ẑ`), so each sample is internally consistent and every metric is computed in MXN/MWh after inversion.
@@ -191,7 +192,7 @@ The same `μ_D, σ_D` standardize the 168 input hours, the 24 target hours durin
 | Indexing | Frozen at day *D*, not rolling hour by hour | With `μ_t, σ_t` changing inside the sample, the target would be expressed in units that change from hour to hour |
 | Causality | Only prices published before the forecast is issued enter `μ_D, σ_D` | For MDA that is everything through 23:00 of day *D*; backtests use the same cutoff |
 | Components | `pml_ene`, `pml_per`, `pml_cng`: own trailing mean removed, divided by the **same** `σ_D` as the total price | Relative magnitudes and the identity `pml = ene + per + cng` survive scaling. Phase 2 scales MTR with the MDA statistics of the same node and day, so the spread stays in the same units |
-| Level fed back | Three scalars re-enter as static inputs: `μ_D / 1000` (price level), `σ_D / μ_D` (relative volatility), `(μ_7d − μ_D) / σ_D` (short-term trend) | Standardization removes the level; the model still needs to know the regime, without the targets depending on it |
+| Level fed back | Three scalars re-enter as static inputs: `μ_D / 1000` (price level), `σ_D / 1000` (volatility, same units), `(μ_7d − μ_D) / σ_D` (short-term trend; bounded because `σ_D ≥ 10`) | Standardization removes the level; the model still needs to know the regime, without the targets depending on it. Relative volatility `σ_D / μ_D` was **rejected**: with zero and negative prices the 28-day mean can sit near zero and the ratio explodes (μ = 5, σ = 800 → 160; μ = −2 → −400). The network can form the ratio itself from the two scalars if it helps. If the P6 quality report shows a heavy tail in `σ_D` across nodes, `log1p(σ_D)` replaces `σ_D / 1000` — decided at P6, not searched |
 | Requirement | A node needs **≥ 28 days of published MDA history** | Younger nodes are rejected explicitly by the API (§4); listed in the supported scope (§5.2) |
 | Tested, not assumed | Scaling window (7 / 28 / 90 days) and robust statistics (median / IQR) are hyperparameters in task 2.2 | 28 days with mean / std is the default and the first setting frozen if the search is cut (scope guard) |
 
@@ -201,13 +202,13 @@ This is the main mechanism that lets the model forecast nodes it has never seen:
 
 | Layer | Store | Contents |
 |---|---|---|
-| Bronze | Delta table in Databricks Unity Catalog | Raw CENACE JSON records, append-only, with ingestion timestamp |
-| Silver | Delta table | Clean hourly series: one row per `(node, market, timestamp)` with `market ∈ {MDA, MTR}`, DST-aligned, quality flags |
-| Gold | Delta table | Model-ready windows and daily forecasts (`node, market, target_date, hora, pml_pred, model_version, issued_at`) |
+| Bronze | One JSON envelope per request under `data/bronze/` | Raw CENACE response verbatim, plus URL, status, timing and the nodes and dates asked for |
+| Silver | One Parquet file per node under `data/silver/market=X/` | Clean hourly series: one row per `(node, market, timestamp)`, DST-aligned, quality flags (`ok`, `dst_fill`, `dst_merge`, `interp`, `missing`) |
+| Gold | Parquet under `data/gold/` | Model-ready dataset artifacts (arrays, per-sample index, metadata) and forecasts (`node, market, target_date, hora, pml_pred, pml_actual, model_version, issued_at`) |
 | Reproducibility snapshot | Parquet files versioned in the GitHub repo (`data/`) | The exact training/validation/test data used for the reported results |
-| Models & metrics | MLflow (Databricks) | Every experiment run, parameters, metrics, artifacts; registered model versions |
+| Models & metrics | MLflow, SQLite store (`mlflow.db`) with artifacts under `mlruns/` | Every experiment run, parameters, metrics, artifacts; registered model versions |
 
-Storing the snapshot in the repo means anyone can reproduce the reported numbers without a Databricks account.
+Storing the snapshot in the repo means anyone can reproduce the reported numbers with nothing but Python: no hosted service, no account, no cloud tier. The three layers are plain files, so the pipeline runs the same on a laptop, in CI and inside the serving container. The schemas match the Delta tables the layers would use if the project ever moves to a warehouse.
 
 ## 6. Ethics and Fairness
 
@@ -233,9 +234,9 @@ Storing the snapshot in the repo means anyone can reproduce the reported numbers
 |---|---|
 | End users | Web browser on desktop (responsive layout); no installation |
 | API consumers | HTTPS REST endpoint returning JSON |
-| Serving & MLOps | **Databricks Free Edition**: serverless compute, Unity Catalog (Delta tables), MLflow tracking & model registry, **Model Serving** endpoint, scheduled Jobs for daily ingestion and batch forecasts, Databricks dashboard (or a Streamlit Databricks App) for the UI |
-| Fallback (risk mitigation) | FastAPI + Docker container serving the same model, deployable on any Linux host, if Model Serving proves unavailable or too limited on the free tier |
-| Development | macOS, Python 3.11, TensorFlow/Keras, NumPy, pandas, scikit-learn (baselines), pytest, GitHub Actions CI, Black |
+| Serving & MLOps | **FastAPI + Docker** serving the model from the MLflow registry on any Linux host, plus scheduled jobs for daily ingestion and batch forecasts. MLflow tracks runs locally (SQLite store, artifacts on disk) so nothing depends on a hosted tier |
+| Optional extra (tried last) | **Databricks Free Edition** Model Serving from the same MLflow model, if the free tier turns out to allow it. Decided after the model exists, since a container already satisfies the deliverable |
+| Development | macOS, Python 3.12, TensorFlow/Keras, NumPy, pandas, scikit-learn (baselines), pytest, GitHub Actions CI, Black |
 
 ## 8. Model and Evaluation Plan
 
@@ -245,12 +246,12 @@ Storing the snapshot in the repo means anyone can reproduce the reported numbers
 
 | Attribute | Encoding | Why |
 |---|---|---|
-| Regional control center | One-hot (7; all present in training; *No Aplica* → UNKNOWN) | Small, closed vocabulary |
+| Regional control center | One-hot (7 regions + UNKNOWN for the *No Aplica* nodes; all present in training) | Small, closed vocabulary |
 | Voltage level | `log(kV)`, standardized | Ordinal with physical meaning; a number interpolates between levels instead of needing every level in a vocabulary. Training must span 400/230/115 kV (Stage 2); the feature is not trusted outside that range |
 | Load zone | Embedding + **UNKNOWN** token, with **20–30 % category dropout** during training (the zone is randomly replaced by UNKNOWN) so the fallback vector is actually learned | 109 zones vs. ~100 training nodes: half the zones have no node, most of the rest one to three. A plain embedding would have no vector for unseen zones and, for seen ones, would act as a node identity in disguise |
 | State / municipality | **Not an input** in the MVP: redundant with region + zone and with the same sparsity problem. Kept in the dimension table; municipality lat/lon is a later experiment as a vocabulary-free replacement for load zone | Avoids a third sparse categorical |
 | Node identity | **Never** in the main model; ablation only | Keeps the model usable on unseen nodes |
-| Price level (from the scaling statistics, §5.3) | Three scalars: `μ_D / 1000`, `σ_D / μ_D`, `(μ_7d − μ_D) / σ_D` | Standardization removes the level; these give it back as inputs without making the targets depend on it |
+| Price level (from the scaling statistics, §5.3) | Three scalars: `μ_D / 1000`, `σ_D / 1000`, `(μ_7d − μ_D) / σ_D` | Standardization removes the level; these give it back as inputs without making the targets depend on it. No ratio with `μ_D` in the denominator (§5.3) |
 
 **Timing.** The forecast for day *D+1* is issued early on day *D*, before offers close and before CENACE publishes the *D+1* MDA results later that day; the published results are the ground truth, so each forecast is scored within hours. **Training window** (2016 → vs 2022 →) is treated as a hyperparameter, since older years come from a different market regime.
 
@@ -271,13 +272,20 @@ Storing the snapshot in the repo means anyone can reproduce the reported numbers
 
 **Validation.** Strict time ordering: train on the oldest data, validate on the next block, test on the **last 6 months** with walk-forward (re-forecast each day using only past data). **Two held-out regimes, reported separately.** *Leave-one-node-out*: hold out one node whose load zone still has other nodes in training — a new node in a known zone. *Leave-one-zone-out*: hold out every node of a load zone, so the held-out nodes are scored with the UNKNOWN zone — a new node in a zone the model has never seen. Together they measure the generalization claim the product actually makes (§5.2, supported scope), instead of one average that mixes both cases.
 
-**Metrics.** MAE and RMSE in MXN/MWh, sMAPE, **skill score vs. Naive-168h** (`1 − MAE_model / MAE_naive`), error by hour of day, and a **top-4-hours hit rate** (how often the model's four most expensive predicted hours match the actual four most expensive hours — the metric that maps directly to "when should I inject"). All reported overall and excluding spike days.
+**Metrics.** MAE and RMSE in MXN/MWh, sMAPE, **skill score vs. Naive-168h** (`1 − MAE_model / MAE_naive`), error by hour of day, and two product metrics computed per `(node, day)` and averaged:
+
+```
+Top-4 overlap  = |PredTop4 ∩ ActualTop4| / 4                       share of the four most expensive real hours the forecast identified
+Captured value = Σ P_actual[PredTop4] / Σ P_actual[ActualTop4]     share of the best possible 4-hour revenue actually captured
+```
+
+Top-4 overlap is a **set overlap, not an exact match**: predicting {17, 19, 20, 21} against a real {18, 19, 20, 21} scores 0.75, not 0. Picking four hours at random scores 0.167 in expectation, and Naive-168h is expected to score well above that because the evening peak is regular, so the success criterion below is stated relative to the baseline. Captured value is the metric that maps directly to revenue — a wrong hour whose price is almost as high costs almost nothing — and is reported, not targeted. The contiguous injection window shown in the dashboard (e.g. 18:00–21:00) is a product heuristic derived from the forecast; the metrics are evaluated on the top-4 set. All metrics are reported overall and excluding spike days.
 
 **Success criteria (targets, to be reported honestly either way).**
 
 - Skill ≥ 15 % vs. Naive-168h on the 6-month test set for training nodes.
 - Skill ≥ 5 % vs. Naive-168h on held-out nodes in **both** regimes (zone seen, zone unseen), reported separately.
-- Top-4-hours hit rate ≥ 60 %.
+- Top-4 overlap ≥ 60 % **and** above Naive-168h on the 6-month test set (the absolute floor alone could be met by the baseline).
 - LSTM + metadata ≥ LSTM history-only in both held-out regimes (the metadata must earn its place; otherwise the history-only model ships).
 - Phase 2, only if reached: skill ≥ 5 % vs. the *MTR = MDA* baseline on the 6-month test set.
 - Endpoint responds in < 2 s; daily job success rate ≥ 95 % over the demo period.
@@ -289,7 +297,7 @@ Storing the snapshot in the repo means anyone can reproduce the reported numbers
 1. CENACE collector + preprocessing pipeline, with tests, producing the silver Delta table and the Parquet snapshot.
 2. Dataset builder (windowing, per-node scaling, time-based splits).
 3. Four baselines and the LSTM variants (history-only, + metadata, + node-ID ablation), all logged in MLflow, with the full evaluation report (tables + plots, both held-out regimes) for the Stage 2 node set (~100 SIN nodes; minimum ~30).
-4. One **SIN-wide model conditioned on node metadata** (region one-hot, voltage as a number, load zone with UNKNOWN), queried by node key, with a documented supported scope, registered in MLflow and deployed as a Databricks Model Serving endpoint. Fallback scope if Stage 2 collection lags: the Peninsular region only.
+4. One **SIN-wide model conditioned on node metadata** (region one-hot, voltage as a number, load zone with UNKNOWN), queried by node key, with a documented supported scope, registered in MLflow and served from a FastAPI container. Fallback scope if Stage 2 collection lags: the Peninsular region only.
 5. Daily scheduled job: fetch latest prices → forecast tomorrow for all tracked nodes → write to the gold table.
 6. Dashboard: tomorrow's 24-hour forecast per node with injection/charging windows, latest forecast vs. published MDA, model card panel.
 7. README with architecture, results, limitations and how to reproduce; model card; blog post; presentation; live demo.
@@ -301,7 +309,7 @@ Storing the snapshot in the repo means anyone can reproduce the reported numbers
 - BCA and BCS isolated systems (separate models or system feature).
 - Exogenous features (demand forecast, gas price).
 - Attention/Transformer or gradient-boosting challenger.
-- Public FastAPI mirror of the endpoint.
+- Databricks Model Serving as a hosted mirror of the containerized endpoint.
 
 ### Out of scope
 
@@ -321,10 +329,10 @@ Build window: **Monday, August 31 – Thursday, September 24, 2026** (3½ weeks)
 |---|---|---|
 | P1 | Submit this pitch; secure mentor/alumni reviewer | Pitch approved, reviewer named |
 | P2 | Create repo, GitHub Project board, CI skeleton (pytest, Black) | Green CI on empty test suite |
-| P3 | Databricks Free Edition workspace; **go/no-go check that Model Serving is available** | Toy model served through an endpoint; else fallback decided |
+| P3 | *(moved to week 4)* Databricks Model Serving is no longer on the critical path: the deliverable is a container, so the hosted option is tried only once the final model exists | Decision recorded in the model card |
 | P4 | CENACE collector (7-day windows, 20-node batches, retries, idempotent upsert, bronze table) with tests | **Stage 1**: Peninsular nodes collected 2022→present; pipeline smoke-tested end to end |
-| P5 | Node metadata dimension table from the CENACE *Catálogo NodosP*; select the **Stage 2** set (~100 nodes: all 400 kV plus 230 kV and 115 kV nodes, ≥ 2 per regional control center per voltage level) and collect it over the nights of Sep 3–5: MDA 2016 →, MTR 2022 → | Dimension + silver tables populated; coverage report by region × voltage × load zone; **go/no-go: SIN-wide vs Peninsular MVP** recorded |
-| P6 | Data quality report: gaps, zeros, spikes, DST days, per-node price level | Notebook + summary in `docs/data_quality.md` |
+| P5 | Node metadata dimension table from the CENACE *Catálogo NodosP*; select the **Stage 2** set (~100 nodes: all 400 kV plus 230 kV and 115 kV nodes, ≥ 2 per regional control center per voltage level where available) and collect it over the nights of Sep 3–5: MDA 2016 →, MTR 2022 → | Dimension + silver tables populated; coverage report by region × voltage × load zone; **go/no-go: SIN-wide vs Peninsular MVP** recorded |
+| P6 | Data quality report: gaps, zeros, spikes, DST days, per-node price level, distribution of the 28-day `σ_D` across nodes (decides `σ_D / 1000` vs `log1p(σ_D)` as the volatility scalar) | Notebook + summary in `docs/data_quality.md` |
 
 ### M1 — Dataset & baselines (Mon Sep 7 – Thu Sep 10)
 
@@ -333,7 +341,7 @@ Build window: **Monday, August 31 – Thursday, September 24, 2026** (3½ weeks)
 | 1.1 | Preprocessing: DST alignment, gap handling, per-node scaling (28-day trailing z-score frozen at the forecast origin, §5.3), holiday features, metadata encoders (region one-hot, `log(kV)`, load-zone vocabulary + UNKNOWN) | Tested module |
 | 1.2 | Dataset builder: 168→24 windows aligned to the MDA publication schedule, target-day calendar features, time-based train/val/test split, walk-forward iterator, held-out-node and held-out-zone splits | Tested module; shapes documented |
 | 1.3 | Baselines: Naive-24h, Naive-168h, seasonal MA, linear regression | Results logged in MLflow |
-| 1.4 | Evaluation module: MAE/RMSE/sMAPE, skill score, per-hour error, top-4-hours hit rate, spike-aware split | Tested; baseline report generated |
+| 1.4 | Evaluation module: MAE/RMSE/sMAPE, skill score, per-hour error, top-4 overlap (set intersection over 4, not exact match), captured value, spike-aware split | Tested; baseline report generated |
 | **M1** | **Milestone: baseline report published in README** | |
 
 ### M2 — LSTM (Fri Sep 11 – Tue Sep 15)
@@ -350,7 +358,7 @@ Build window: **Monday, August 31 – Thursday, September 24, 2026** (3½ weeks)
 
 | # | Task | Done when |
 |---|---|---|
-| 3.1 | Deploy Model Serving endpoint; request/response contract (`target_date` optional → tomorrow; past dates → backtest mode with as-of cutoff; more than one day ahead → rejected; supported-scope check on the node); contract tests | `curl` returns 24 prices for a node, with and without `target_date` |
+| 3.1 | Deploy the FastAPI + Docker endpoint; request/response contract (`target_date` optional → tomorrow; past dates → backtest mode with as-of cutoff; more than one day ahead → rejected; supported-scope check on the node); contract tests | `curl` returns 24 prices for a node, with and without `target_date` |
 | 3.2 | Daily jobs: 06:00 America/Mexico_City — ingest latest MDA → features → forecast *D+1* for all nodes → gold table; afternoon — score the forecast against the published MDA | Jobs run on schedule 2 consecutive days |
 | 3.3 | Dashboard: forecast chart, injection/charging windows, latest forecast vs published MDA, model card panel | Usable end-to-end in browser |
 | 3.4 | Monitoring: log daily skill vs naive; data-freshness indicator; graceful degradation | Visible in dashboard |
@@ -372,7 +380,7 @@ Build window: **Monday, August 31 – Thursday, September 24, 2026** (3½ weeks)
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| Databricks Free Edition lacks or limits Model Serving | Medium | Go/no-go in P3; fallback FastAPI + Docker with the same MLflow model |
+| Databricks Free Edition lacks or limits Model Serving | Medium | No longer a project risk: FastAPI + Docker is the default target and runs on any Linux host. Databricks became an optional extra |
 | CENACE API slowness / instability / blocking | Medium | Measured 2.4–19 s per 20-node week; parallelism does not help, so the Stage 2 set (~2,800 calls) runs over one or two nights, sequentially, with backoff. The manual lets CENACE disable the service for misuse, which is one more reason to stay polite. Bronze layer + retries; staged collection starts day 1; repo snapshot means training never depends on the live API. Fallback scope: Peninsular region |
 | Node catalog changes (renamed nodes, new columns) | Low | Catalog is versioned monthly; store the version used; key everything by `clv_nodo` |
 | Metadata features do not generalize to unseen load zones | Medium | UNKNOWN token trained with category dropout; both held-out regimes reported; per-node scaling carries most of the signal, so the history-only model ships if metadata does not earn its place |
@@ -386,14 +394,15 @@ Build window: **Monday, August 31 – Thursday, September 24, 2026** (3½ weeks)
 1. Hyperparameter search narrowed to window length and loss; scaling frozen at 28 days with mean / std, everything else at sensible defaults.
 2. Leave-one-zone-out limited to three held-out zones; node-ID ablation dropped.
 3. Blog post reduced to an outline inside the window, finished after submission.
-4. Dashboard limited to Databricks' built-in dashboard; no separate Streamlit app.
-5. Peninsular-only model (the M0 go/no-go on September 6 already covers this).
+4. Dashboard limited to a single static page served by the same container; no separate app.
+5. Peninsular-only model (the M0 scope go/no-go already covers this).
 
 Never cut: tests, the evaluation report with both held-out regimes, the model card, the live endpoint, the README.
 
 ## 11. Mentor / Reviewer
 
-**TBD.** 
+**Ricardo Best** reviews this pitch before and the finished
+product at the end.
 
 ## 12. Definition of Done
 
