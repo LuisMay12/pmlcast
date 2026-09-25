@@ -1,0 +1,13 @@
+tensorflow>=2.21,<2.22
+numpy<2.5  # pandas 2.3 + numpy 2.5 emit timedelta deprecation warnings
+pandas
+pyarrow
+requests
+holidays
+scikit-learn
+mlflow
+matplotlib
+openpyxl
+tabulate
+fastapi
+uvicorn

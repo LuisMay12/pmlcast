@@ -1,0 +1,18 @@
+[project]
+name = "pmlcast"
+version = "0.1.0"
+description = "Day-ahead hourly PML price forecasting for Mexican grid nodes"
+requires-python = ">=3.12,<3.13"
+
+[tool.black]
+line-length = 79
+target-version = ["py312"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::FutureWarning",
+]

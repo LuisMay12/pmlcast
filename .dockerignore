@@ -1,0 +1,10 @@
+.git
+.venv
+.pytest_cache
+mlruns
+mlflow.db
+notebooks
+tests
+docs
+data/*
+!data/demo

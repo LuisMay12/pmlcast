@@ -1,0 +1,11 @@
+# Just what the service needs to answer a forecast: no TensorFlow, no
+# training stack. The model runs through ONNX Runtime instead.
+onnxruntime
+numpy
+pandas
+pyarrow
+holidays
+fastapi
+uvicorn
+openpyxl
+requests

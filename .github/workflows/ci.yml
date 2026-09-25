@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MPLBACKEND: Agg
+  TF_CPP_MIN_LOG_LEVEL: "2"
+  PYTHONHASHSEED: "0"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Format check
+        run: black --check pmlcast tests
+      - name: Lint
+        run: flake8 pmlcast tests
+      - name: Tests
+        run: pytest -q
