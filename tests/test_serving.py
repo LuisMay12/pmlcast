@@ -62,8 +62,18 @@ def test_out_of_scope_node_is_rejected():
         forecaster.check_scope("07PJZ-230")
     assert "BCA" in str(error.value)
 
-    # a SIN node and an uncatalogued one both pass the scope check
+    # a SIN node passes; a key in no catalogue is named as such rather
+    # than failing later for missing history
     forecaster.check_scope("01TUL-400")
+    with pytest.raises(serving.ForecastError) as unknown:
+        forecaster.check_scope("99XXX-115")
+    assert "not in the CENACE catalogue" in str(unknown.value)
+
+
+def test_uncatalogued_node_passes_when_no_catalogue_is_loaded():
+    """With no catalogue at all, history is the only requirement."""
+    forecaster = FakeForecaster(pd.DataFrame(columns=["node", "sistema"]))
+
     forecaster.check_scope("99XXX-115")
 
 

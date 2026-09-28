@@ -108,10 +108,19 @@ class Forecaster:
         The pitch promises an explicit error instead of an extrapolated
         curve: a node of an unsupported system or voltage level, or one
         with too little published history, is rejected here.
+
+        A key that is in no catalogue at all is named as such. Otherwise
+        the request fails later for missing history, which reads like a
+        data gap when the real answer is that the node does not exist.
         """
         row = self.node_row(node)
         if row is None:
-            return  # not catalogued: silver history is the only requirement
+            if len(self.catalog):
+                raise ForecastError(
+                    "node {} is not in the CENACE catalogue".format(node)
+                )
+
+            return  # no catalogue loaded: history is the only requirement
 
         if row["sistema"] != "SIN":
             raise ForecastError(

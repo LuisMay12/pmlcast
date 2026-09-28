@@ -148,7 +148,9 @@ PAGE = """<!doctype html>
     <div class="row">
       <div>
         <label for="node">Node</label>
-        <select id="node"></select>
+        <input id="node" list="nodelist" autocomplete="off"
+               placeholder="e.g. 01PIT-400">
+        <datalist id="nodelist"></datalist>
       </div>
       <div>
         <label for="date">Target date (blank = tomorrow)</label>
@@ -174,10 +176,13 @@ const $ = (id) => document.getElementById(id);
 
 async function boot() {{
   const meta = await (await fetch("/dashboard/data")).json();
-  $("node").innerHTML = meta.nodes
+  $("nodelist").innerHTML = meta.nodes
     .map((n) => `<option value="${{n.node}}">` +
                 `${{n.node}} - ${{n.region}}</option>`)
     .join("");
+  if (!$("node").value && meta.nodes.length) {{
+    $("node").value = meta.nodes[0].node;
+  }}
   const card = meta.model;
   const recent = card.recent || {{}};
   $("card").innerHTML = `
@@ -201,7 +206,14 @@ async function run() {{
   $("go").disabled = true;
   $("status").textContent = "Forecasting...";
   $("status").className = "muted";
-  const body = {{ node: $("node").value }};
+  const node = $("node").value.trim().toUpperCase();
+  if (!node) {{
+    $("status").textContent = "Type or pick a node first.";
+    $("status").className = "error";
+    $("go").disabled = false;
+    return;
+  }}
+  const body = {{ node: node }};
   if ($("date").value) body.target_date = $("date").value;
 
   // A node whose stored prices stopped short is filled from CENACE
@@ -243,7 +255,20 @@ async function run() {{
   $("go").disabled = false;
 
   if (!response.ok) {{
-    $("status").textContent = data.detail || "Could not forecast.";
+    // The API already says why in plain words; the prefix tells the
+    // three cases apart at a glance: a key that does not exist, a real
+    // node this model does not cover, and one CENACE has not published
+    // enough history for yet.
+    const why = data.detail || "Could not forecast.";
+    let lead = "Rejected";
+    if (/not in the CENACE catalogue/.test(why)) {{
+      lead = "No such node";
+    }} else if (/out of scope/.test(why)) {{
+      lead = "Out of scope";
+    }} else if (/history/.test(why)) {{
+      lead = "Not enough published history";
+    }}
+    $("status").textContent = `${{lead}}: ${{why}}`;
     $("status").className = "error";
     $("result").hidden = true;
     return;
