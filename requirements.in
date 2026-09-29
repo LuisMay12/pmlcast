@@ -11,3 +11,4 @@ openpyxl
 tabulate
 fastapi
 uvicorn
+onnxruntime

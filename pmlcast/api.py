@@ -99,9 +99,7 @@ def main():
         # Render and most PaaS hand the port in $PORT; PMLCAST_PORT is
         # the local override and 8000 the development default.
         port=int(
-            os.environ.get("PORT")
-            or os.environ.get("PMLCAST_PORT")
-            or "8000"
+            os.environ.get("PORT") or os.environ.get("PMLCAST_PORT") or "8000"
         ),
     )
 
