@@ -80,9 +80,7 @@ def test_uncatalogued_node_passes_when_no_catalogue_is_loaded():
 def test_evaluated_set_is_read_from_the_nodes_file(tmp_path):
     """A node outside the evaluation set is served, and marked as such."""
     path = tmp_path / "nodes.csv"
-    path.write_text(
-        "node,sistema\n01TUL-400,SIN\n", encoding="utf-8"
-    )
+    path.write_text("node,sistema\n01TUL-400,SIN\n", encoding="utf-8")
     evaluated = set(cenace.read_nodes_file(str(path)))
 
     assert "01TUL-400" in evaluated
