@@ -15,6 +15,7 @@ data/*
 !data/snapshot/
 !data/demo/
 !data/demo/**
+data/demo/bronze/
 
 # Logs and local scratch
 *.log
