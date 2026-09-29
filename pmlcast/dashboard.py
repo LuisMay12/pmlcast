@@ -8,6 +8,7 @@ import os
 import pandas as pd
 
 import pmlcast
+from pmlcast import config
 from pmlcast import storage
 
 # `daily` imports the evaluation stack (matplotlib, scikit-learn), which
@@ -18,15 +19,30 @@ SCORE_TABLE = "daily_scores"
 PAGE_TITLE = "PMLcast"
 
 
-def node_options(nodes_file):
-    """Return the nodes the dashboard offers, grouped by region."""
+def node_options(nodes_file, catalog_path=None):
+    """Return the nodes the dashboard offers, grouped by region.
+
+    A node key says nothing about where it is, so the catalogue's name and
+    municipality are joined in when it is available: picking a node is
+    easier from "Tula, Hidalgo" than from ``01TUL-400``.
+    """
     if not os.path.exists(nodes_file):
         return []
 
     frame = pd.read_csv(nodes_file)
+    columns = ["node", "region", "zone", "kv"]
+
+    path = catalog_path or os.path.join(config.CATALOG_DIR, "nodes.parquet")
+    if os.path.exists(path):
+        catalog = pd.read_parquet(path)
+        keep = ["node", "name", "municipality", "state"]
+        available = [c for c in keep if c in catalog.columns]
+        frame = frame.merge(catalog[available], on="node", how="left")
+        columns += [c for c in available if c != "node"]
+
     frame = frame.sort_values(["region", "node"])
 
-    return frame[["node", "region", "zone", "kv"]].to_dict("records")
+    return frame[columns].to_dict("records")
 
 
 def latest_scored(gold_dir, node=None):
@@ -110,58 +126,98 @@ PAGE = """<!doctype html>
 <meta charset="utf-8">
 <title>{title}</title>
 <style>
- body {{ font: 15px/1.5 -apple-system, system-ui, sans-serif; margin: 0;
-        background: #f6f7f9; color: #1a1d21; }}
- header {{ background: #12263f; color: #fff; padding: 18px 24px; }}
- header h1 {{ margin: 0; font-size: 20px; }}
- header p {{ margin: 4px 0 0; opacity: .75; font-size: 13px; }}
+ :root {{
+   --night: #111c2e; --night-soft: #1c2b44; --amber: #f2a007;
+   --amber-lt: #ffcf5c; --cream: #f7f5f0; --slate: #5a6b84;
+   --ink: #16202e; --line: #e4e6ea; --green: #3fa07a; --red: #c4553b;
+ }}
+ * {{ box-sizing: border-box; }}
+ body {{ font: 15px/1.55 -apple-system, system-ui, sans-serif; margin: 0;
+        background: var(--cream); color: var(--ink); }}
+ header {{ background: var(--night); color: #fff; padding: 22px 24px; }}
+ header .wrap {{ max-width: 980px; margin: 0 auto; }}
+ header h1 {{ margin: 0; font-size: 22px; letter-spacing: -.2px; }}
+ header h1 span {{ color: var(--amber); }}
+ header p {{ margin: 5px 0 0; color: #9fb0c9; font-size: 13px; }}
  main {{ max-width: 980px; margin: 0 auto; padding: 24px; }}
- .row {{ display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-end; }}
- .card {{ background: #fff; border: 1px solid #e3e6ea; border-radius: 8px;
-         padding: 18px; margin-bottom: 18px; }}
- label {{ display: block; font-size: 13px; color: #5b6472;
-         margin-bottom: 4px; }}
- select, input, button {{ font: inherit; padding: 7px 10px;
-         border: 1px solid #ccd2d9; border-radius: 6px; }}
- button {{ background: #12263f; color: #fff; border-color: #12263f;
-          cursor: pointer; }}
- button:disabled {{ opacity: .5; cursor: default; }}
+ .card {{ background: #fff; border: 1px solid var(--line); border-radius: 10px;
+         padding: 20px; margin-bottom: 18px; }}
+ .card h3 {{ margin: 0 0 14px; font-size: 15px; }}
+
+ /* The picker: a labelled field group rather than three loose inputs. */
+ .picker {{ display: grid; gap: 14px;
+           grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr) auto;
+           align-items: end; }}
+ @media (max-width: 680px) {{ .picker {{ grid-template-columns: 1fr; }} }}
+ .field label {{ display: block; font-size: 11px; font-weight: 600;
+       letter-spacing: .07em; text-transform: uppercase;
+       color: var(--slate); margin-bottom: 6px; }}
+ .field input {{ font: inherit; width: 100%; padding: 11px 13px;
+       border: 1px solid #cfd5dd; border-radius: 8px;
+       background: #fff; color: var(--ink); }}
+ .field input::placeholder {{ color: #9aa5b4; }}
+ .field input:hover {{ border-color: #b3bcc8; }}
+ .field input:focus {{ outline: none; border-color: var(--amber);
+       box-shadow: 0 0 0 3px rgba(242, 160, 7, .18); }}
+ .field .hint {{ font-size: 11px; color: var(--slate); margin: 5px 0 0;
+       min-height: 15px; }}
+ .field .hint.warn {{ color: #9a6400; }}
+ button {{ font: inherit; font-weight: 600; padding: 11px 22px;
+       background: var(--night); color: #fff; border-radius: 8px;
+       border: 1px solid var(--night); cursor: pointer; }}
+ button:hover:not(:disabled) {{ background: var(--night-soft);
+       border-color: var(--night-soft); }}
+ button:focus-visible {{ outline: none;
+       box-shadow: 0 0 0 3px rgba(242, 160, 7, .35); }}
+ button:disabled {{ opacity: .45; cursor: default; }}
+
  table {{ border-collapse: collapse; width: 100%; font-size: 14px; }}
- th, td {{ text-align: right; padding: 5px 8px;
+ th, td {{ text-align: right; padding: 6px 8px;
           border-bottom: 1px solid #eef0f3; }}
+ th {{ font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
+      color: var(--slate); font-weight: 600; }}
  th:first-child, td:first-child {{ text-align: left; }}
- .bar {{ background: #d7e3f4; height: 14px; border-radius: 3px; }}
- .bar.peak {{ background: #e8833a; }}
- .bar.cheap {{ background: #58a55c; }}
- .muted {{ color: #5b6472; font-size: 13px; }}
- .error {{ color: #b3261e; }}
- .pill {{ display: inline-block; background: #eef1f5; border-radius: 999px;
-         padding: 3px 10px; margin-right: 6px; font-size: 12px; }}
+ .bar {{ background: #dde3ec; height: 14px; border-radius: 3px; }}
+ .bar.peak {{ background: var(--amber); }}
+ .bar.cheap {{ background: var(--green); }}
+ .where {{ margin: 0 0 12px; font-size: 14px; color: var(--slate); }}
+ .where strong {{ color: var(--ink); }}
+ .muted {{ color: var(--slate); font-size: 13px; }}
+ .error {{ color: var(--red); font-size: 13px; }}
+ .pill {{ display: inline-block; background: var(--cream);
+         border: 1px solid var(--line); border-radius: 999px;
+         padding: 4px 11px; margin: 0 6px 6px 0; font-size: 12px;
+         color: var(--ink); }}
 </style>
 <header>
-  <h1>PMLcast</h1>
-  <p>Day-ahead hourly prices for Mexican grid nodes. Informational only,
-     not financial advice.</p>
+  <div class="wrap">
+    <h1>PML<span>cast</span></h1>
+    <p>Day-ahead hourly prices for Mexican grid nodes. Informational only,
+       not financial advice.</p>
+  </div>
 </header>
 <main>
   <div class="card">
-    <div class="row">
-      <div>
+    <div class="picker">
+      <div class="field">
         <label for="node">Node</label>
         <input id="node" list="nodelist" autocomplete="off"
-               placeholder="e.g. 01PIT-400">
+               placeholder="Type a node key, or pick one">
         <datalist id="nodelist"></datalist>
+        <p class="hint" id="nodehint"></p>
       </div>
-      <div>
-        <label for="date">Target date (blank = tomorrow)</label>
+      <div class="field">
+        <label for="date">Target date</label>
         <input type="date" id="date">
+        <p class="hint">Blank forecasts tomorrow</p>
       </div>
-      <div><button id="go">Forecast</button></div>
+      <div class="field"><button id="go">Forecast</button></div>
     </div>
     <p class="muted" id="status"></p>
   </div>
 
   <div class="card" id="result" hidden>
+    <p class="where" id="where"></p>
     <div id="windows"></div>
     <table id="hours"></table>
   </div>
@@ -173,16 +229,56 @@ PAGE = """<!doctype html>
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
+let NODES = [];
+let BY_KEY = {{}};
+
+function placeOf(n) {{
+  // Where the node is, in the order a reader scans: town, state, then the
+  // voltage level that distinguishes two nodes in the same town.
+  const town = n.municipality
+    ? n.municipality.charAt(0) + n.municipality.slice(1).toLowerCase()
+    : null;
+  const state = n.state
+    ? n.state.charAt(0) + n.state.slice(1).toLowerCase()
+    : null;
+  const where = [town, state].filter(Boolean).join(", ");
+  const kv = n.kv ? `${{Math.round(n.kv)}} kV` : null;
+  return [n.name, where, kv].filter(Boolean).join(" \u00b7 ")
+    || n.region || n.node;
+}}
+
+function describeNode() {{
+  // The hint carries the node's place when it is known, and otherwise
+  // warns that the published error does not describe it.
+  const key = $("node").value.trim().toUpperCase();
+  const n = BY_KEY[key];
+  if (n) {{
+    $("nodehint").textContent = placeOf(n);
+    $("nodehint").className = "hint";
+  }} else if (key) {{
+    $("nodehint").textContent =
+      "Not in the evaluation set \u2014 it will forecast, but the " +
+      "reported error does not describe it";
+    $("nodehint").className = "hint warn";
+  }} else {{
+    $("nodehint").textContent =
+      `${{NODES.length}} evaluated nodes \u00b7 any SIN node works`;
+    $("nodehint").className = "hint";
+  }}
+}}
 
 async function boot() {{
   const meta = await (await fetch("/dashboard/data")).json();
-  $("nodelist").innerHTML = meta.nodes
-    .map((n) => `<option value="${{n.node}}">` +
-                `${{n.node}} - ${{n.region}}</option>`)
+  NODES = meta.nodes;
+  BY_KEY = {{}};
+  NODES.forEach((n) => {{ BY_KEY[n.node] = n; }});
+  $("nodelist").innerHTML = NODES
+    .map((n) => `<option value="${{n.node}}">${{placeOf(n)}}</option>`)
     .join("");
   if (!$("node").value && meta.nodes.length) {{
     $("node").value = meta.nodes[0].node;
   }}
+  describeNode();
   const card = meta.model;
   const recent = card.recent || {{}};
   $("card").innerHTML = `
@@ -286,6 +382,13 @@ async function run() {{
       ? ""
       : " This node is outside the evaluation set, so the reported error" +
         " does not describe it.");
+  // Name the node and where it is, so a printed or shared forecast still
+  // says which place it describes.
+  const known = BY_KEY[data.node];
+  $("where").innerHTML = known
+    ? `<strong>${{data.node}}</strong> \u2014 ${{placeOf(known)}}`
+    : `<strong>${{data.node}}</strong> \u2014 ${{data.system}}, ` +
+      `${{data.market}}`;
   $("windows").innerHTML = `
     <p><strong>Inject</strong> between hour ${{peak.start_hour}} and
        ${{peak.end_hour}}. <strong>Charge</strong> between hour
@@ -311,6 +414,8 @@ async function run() {{
 }}
 
 $("go").addEventListener("click", run);
+$("node").addEventListener("input", describeNode);
+$("node").addEventListener("change", describeNode);
 boot();
 </script>
 """
