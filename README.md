@@ -9,6 +9,19 @@ Given the last 14 days of hourly prices at a node of the Mexican national
 grid, PMLcast predicts the **24 hourly prices of the next day** so a solar
 plant with a battery can decide when to charge and when to sell.
 
+**In one line: PMLcast tells you in the morning what energy will cost
+tomorrow, before offers close and before CENACE publishes the price.**
+
+| The day before (D) | What happens |
+|---|---|
+| Morning | **PMLcast forecasts tomorrow's 24 prices**, from prices already public |
+| Until 10:00 | Market participants send their offers for tomorrow, without knowing the price |
+| 10:00 | Offers close |
+| Around 18:45 | CENACE publishes tomorrow's prices |
+
+The forecast is useful in the window before 10:00. Once CENACE publishes,
+the real prices are known and the forecast is only scored against them.
+
 Holberton School — Machine Learning Specialization, Portfolio Project.
 Author: Luis May.
 
@@ -35,6 +48,10 @@ day, so at forecast time the most recent MTR price is already a week old,
 which rules out the mirror-image design of feeding it its own recent
 history. Forecasting MTR is [planned as a second
 phase](docs/pitch.md) that conditions on the published MDA instead.
+
+Where the price and its three components (energy, losses, congestion) come
+from, when CENACE publishes them and why the collector asks in seven-day
+windows: [docs/background.md](docs/background.md).
 
 ## Results
 
@@ -64,12 +81,16 @@ schedule and success criteria are in [docs/pitch.md](docs/pitch.md).
 ## How it works
 
 ```
-seq   (336, 9)  ─┐
-cal   (10,)     ─┤
-level (3,)      ─┼─> LSTM(64) → Dropout → LSTM(32) → Dropout
-meta  (9,)      ─┤        → Dense(64, relu) → Dense(24)
-zone  (1,)      ─┘
+seq   (336, 9) ──> LSTM(64) → Dropout(0.2) → LSTM(32) → Dropout(0.2) ─┐
+cal   (10,)    ─────────────────────────────────────────────────────── concat ──> Dense(64, relu) → Dense(24)
+level (3,)     ─────────────────────────────────────────────────────── ┘
 ```
+
+`seq` is the last 336 hours: each hour's price, its three components, the
+hour and weekday as sine/cosine pairs and a holiday flag. `cal` describes
+the target day (weekday, month, holiday) and `level` the node's recent price
+level. Region and voltage inputs were tested and dropped: they did not beat
+the history-only model in both hold-out regimes.
 
 Prices are standardized **per node** against the mean and standard
 deviation of that node's trailing 28 days, frozen at the forecast origin.
@@ -125,8 +146,9 @@ prices. It needs the evaluation stack, so it runs outside the container.
 
 | Path | Role |
 |---|---|
-| `tests/` | 53 tests, run on every push |
-| `docs/` | Model card, pitch, coverage, baselines, model selection |
+| `tests/` | Unit and end-to-end tests, run on every push |
+| `docs/` | Background, model card, pitch, coverage, baselines, model selection |
+| `scripts/export_onnx.py` | Convert the trained Keras model to ONNX, and check they agree |
 | `scripts/build_demo_data.py` | Pack `data/demo/` from the full data tree |
 | `scripts/export_for_databricks.py` | Pack the model and metrics for the notebook |
 | `notebooks/pmlcast_databricks.py` | The Databricks showcase notebook |
@@ -140,23 +162,31 @@ short, the service **asks CENACE for the missing days at request time**,
 then forecasts. A cold node costs a few seconds; the next request for it is
 instant. Enabled with `PMLCAST_BACKFILL=1`, which `deploy/Dockerfile` sets.
 
+Tomorrow can be forecast before CENACE publishes it, which happens around
+18:45 the evening before: the target day's prices are the label, never an
+input, so the service stands in an empty placeholder day for it.
+
 ## Running it
+
+Python 3.12 and [uv](https://docs.astral.sh/uv/). The Makefile points at
+Homebrew's Python; pass another with `PYTHON=...`.
+
+```bash
+make venv install          # or: make venv PYTHON=python3.12 install
+make lint test
+```
 
 ### The service, locally
 
+The backfill writes into the data directory, so serve from a copy rather
+than from the committed `data/demo/`:
+
 ```bash
-make venv install
-PMLCAST_DATA_DIR=$PWD/data/demo PMLCAST_BACKFILL=1 make serve
+cp -r data/demo /tmp/pmlcast-demo
+PMLCAST_DATA_DIR=/tmp/pmlcast-demo PMLCAST_BACKFILL=1 make serve
 ```
 
 Then open <http://localhost:8000>.
-
-### The deployed image
-
-```bash
-docker build -f deploy/Dockerfile -t pmlcast-demo .
-docker run --rm -p 7860:7860 pmlcast-demo
-```
 
 ### The API
 
@@ -173,17 +203,82 @@ says whether the node is one of the 99 the reported error describes — the
 service answers for any of the ~2,444 SIN nodes, but the metrics were
 measured on the evaluation set.
 
-### Reproducing the model
+### Reproducing the model from scratch
+
+Each step reads what the previous one wrote under `data/`, which is not
+committed (about 6 GB). The settings of the published model are pinned in
+the `*-final` targets; they were read back from its MLflow run.
 
 ```bash
-make lint test
-make dataset NAME=final START=2019-01-01
-make baselines NAME=final
-make train NAME=final
+# 1. Node catalogue: the committed snapshot of CENACE's Catálogo NodosP
+make catalog-snapshot
+
+# 2. Prices from CENACE for the 99 evaluation nodes, Jan 2016 onward.
+#    About 2,800 requests in sequence: a few hours. Re-running only asks
+#    for what is missing.
+make collect-stage2-mda
+
+# 3. Model-ready samples: 14-day windows, data 2019-01-01 to 2026-09-19
+make dataset-final
+
+# 4. The four baselines, then the LSTM (64 units, dropout 0.2, MAE)
+make baselines-final
+make train-final
+
+# 5. Keras -> ONNX for serving; fails if the two disagree
+make onnx
 ```
 
-Runs are tracked in MLflow (`sqlite:///mlflow.db`). Seeds are fixed for
-numpy, TensorFlow and the `tf.data` shuffle.
+`make dataset-final` rebuilds the published dataset exactly: the same
+261,842 samples, splits and arrays. Training on CPU takes about twenty
+minutes. Runs are tracked in MLflow (`sqlite:///mlflow.db`) and seeds are
+fixed for numpy, TensorFlow and the `tf.data` shuffle, so a rerun lands on
+the published numbers up to TensorFlow's own non-determinism on a given
+machine.
+
+The steps above reproduce the shipped model. The experiments that chose
+its settings (the hyperparameter search, the window length, the training
+start date and the hold-out tests) live in `pmlcast/experiments.py`
+(`make experiments NAME=<dataset>`); they ran on earlier development
+datasets, and their results are recorded in
+[docs/model_selection.md](docs/model_selection.md) and in MLflow.
+
+## Deployment
+
+The public demo runs on [Render](https://render.com)'s free tier from
+`deploy/Dockerfile`. Nothing is uploaded by hand: Render builds the image
+from this repository on every push to `main`.
+
+**What goes in the image.** Only the serving stack
+(`requirements-serve.txt`: ONNX Runtime, FastAPI, pandas; no TensorFlow)
+and `data/demo/`: one year of prices for the 112 collected nodes, the ONNX
+model, the dataset metadata and the node catalogue. The image is about
+800 MB and runs in about 230 MB of RAM, inside the free tier's 512 MB.
+
+**Refreshing it** after retraining:
+
+```bash
+make onnx          # new model -> data/models/lstm_history_final.onnx
+make demo-data     # repack data/demo/ with that model and a year of prices
+make deploy-image  # build the image Render will build
+make deploy-run    # serve it on http://localhost:7860 to check
+```
+
+Then commit `data/demo/` and merge to `main`.
+
+**Render settings** (Web Service, Docker):
+
+| Setting | Value |
+|---|---|
+| Dockerfile path | `deploy/Dockerfile` |
+| Docker build context | `.` (the repository root, where `data/demo/` lives) |
+| Health check path | `/health` |
+| Instance type | Free |
+| Environment variables | none; the Dockerfile sets `PMLCAST_BACKFILL=1` and Render injects `$PORT` |
+
+A free instance sleeps after 15 minutes without traffic and takes about a
+minute to wake, and its disk is reset on every start: the first request for
+a node after a restart backfills again.
 
 ## Scope and limitations
 

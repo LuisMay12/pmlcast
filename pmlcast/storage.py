@@ -294,10 +294,18 @@ def read_silver(
     return df.sort_values(order).reset_index(drop=True)
 
 
-def silver_coverage(silver_dir, market):
-    """Return the ``(node, date)`` pairs with 24 observed hours in silver."""
+def silver_coverage(silver_dir, market, nodes=None):
+    """Return the ``(node, date)`` pairs with 24 observed hours in silver.
+
+    ``nodes`` limits the read to those nodes. The service backfills one node
+    at a time, and reading every node's history just to plan that one
+    request is what pushed the free instance past its memory limit.
+    """
     df = read_silver(
-        silver_dir, market=market, columns=["node", "fecha", "quality"]
+        silver_dir,
+        market=market,
+        nodes=nodes,
+        columns=["node", "fecha", "quality"],
     )
     if df.empty:
         return set()

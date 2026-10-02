@@ -342,6 +342,7 @@ def collect(
     dry_run=False,
     log=None,
     sleep=time.sleep,
+    fresh=False,
 ):
     """Collect prices for nodes over a date range into bronze and silver.
 
@@ -362,13 +363,18 @@ def collect(
         dry_run: Only plan and report, without any HTTP call.
         log: Optional logger.
         sleep: Function used to pause between requests (injectable).
+        fresh: Plan from silver alone and ignore stored envelopes. A window
+            first requested before CENACE had published all of its days
+            would otherwise count as done forever, and the days published
+            later would never be fetched. The service backfill uses it; the
+            bulk collector keeps the cache.
 
     Returns:
         Summary dict with request and event counts.
     """
     log = log or logging.getLogger("pmlcast")
-    have = storage.silver_coverage(silver_dir, proceso)
-    if not refetch_empty:
+    have = storage.silver_coverage(silver_dir, proceso, nodes=nodes)
+    if not (refetch_empty or fresh):
         have |= storage.bronze_requested(bronze_dir, proceso)
     plan = plan_requests(nodes, sistema, proceso, start, end, have)
 
@@ -396,7 +402,7 @@ def collect(
         path = storage.bronze_path(bronze_dir, request)
         stored = storage.find_bronze(bronze_dir, request)
         response = None
-        if stored:
+        if stored and not fresh:
             _, cached = storage.read_bronze(stored)
             if not (refetch_empty and not cached.get("text")):
                 response = cached

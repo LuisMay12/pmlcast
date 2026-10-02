@@ -73,6 +73,7 @@ flatbuffers==25.12.19
     # via
     #   onnxruntime
     #   tensorflow
+    #   tf2onnx
 fonttools==4.64.0
     # via matplotlib
 frozenlist==1.8.0
@@ -151,6 +152,7 @@ mdurl==0.1.2
 ml-dtypes==0.6.0
     # via
     #   keras
+    #   onnx
     #   tensorflow
 mlflow==3.15.2
     # via -r requirements.in
@@ -175,12 +177,16 @@ numpy==2.4.6
     #   matplotlib
     #   ml-dtypes
     #   mlflow
+    #   onnx
     #   onnxruntime
     #   pandas
     #   scikit-learn
     #   scipy
     #   skops
     #   tensorflow
+    #   tf2onnx
+onnx==1.23.1
+    # via tf2onnx
 onnxruntime==1.30.0
     # via -r requirements.in
 openpyxl==3.1.5
@@ -232,9 +238,11 @@ protobuf==6.33.6
     #   databricks-sdk
     #   mlflow-skinny
     #   mlflow-tracing
+    #   onnx
     #   onnxruntime
     #   opentelemetry-proto
     #   tensorflow
+    #   tf2onnx
 pyarrow==25.0.1
     # via
     #   -r requirements.in
@@ -277,6 +285,7 @@ requests==2.34.2
     #   docker
     #   mlflow-skinny
     #   tensorflow
+    #   tf2onnx
 rich==15.0.0
     # via keras
 scikit-learn==1.9.0
@@ -317,6 +326,8 @@ tensorflow==2.21.0
     # via -r requirements.in
 termcolor==3.3.0
     # via tensorflow
+tf2onnx==1.17.0
+    # via -r requirements.in
 threadpoolctl==3.6.0
     # via scikit-learn
 typing-extensions==4.16.0
@@ -329,6 +340,7 @@ typing-extensions==4.16.0
     #   graphene
     #   grpcio
     #   mlflow-skinny
+    #   onnx
     #   opentelemetry-api
     #   opentelemetry-sdk
     #   opentelemetry-semantic-conventions

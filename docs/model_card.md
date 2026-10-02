@@ -174,11 +174,18 @@ not, instead of a single flattering average.
 
 ```bash
 make lint test
-make dataset NAME=final START=2019-01-01
-make baselines NAME=final
-make train NAME=final
-make serve          # dashboard and API on http://localhost:8000
+make catalog-snapshot
+make collect-stage2-mda   # prices from CENACE; a few hours, cached
+make dataset-final        # 14-day windows, 2019-01-01 to 2026-09-19
+make baselines-final
+make train-final          # LSTM 64, dropout 0.2, MAE, patience 6
+make onnx                 # the model the service runs
 ```
+
+The `*-final` targets pin the settings of this model, read back from its
+MLflow run; the generic `make dataset` and `make train` keep development
+defaults (a 7-day window, Huber loss) and would build a different model.
+The full walkthrough, including deployment, is in the README.
 
 Runs are tracked in MLflow (`sqlite:///mlflow.db`, artifacts under
 `mlruns/`). Seeds are fixed for numpy, TensorFlow and the `tf.data` shuffle.
