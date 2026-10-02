@@ -170,9 +170,11 @@ PAGE = """<!doctype html>
          padding: 20px; margin-bottom: 18px; }}
  .card h3 {{ margin: 0 0 14px; font-size: 15px; }}
 
- /* The picker: a labelled field group rather than three loose inputs. */
+ /* The picker: a labelled field and its button. There is no date: the
+    service forecasts the day after the last one CENACE has published,
+    the only day a forecast is still news for. */
  .picker {{ display: grid; gap: 14px;
-           grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr) auto;
+           grid-template-columns: minmax(0, 1fr) auto;
            align-items: end; }}
  @media (max-width: 680px) {{ .picker {{ grid-template-columns: 1fr; }} }}
  .field label {{ display: block; font-size: 11px; font-weight: 600;
@@ -231,11 +233,6 @@ PAGE = """<!doctype html>
                placeholder="Type a node key, or pick one">
         <datalist id="nodelist"></datalist>
         <p class="hint" id="nodehint"></p>
-      </div>
-      <div class="field">
-        <label for="date">Target date</label>
-        <input type="date" id="date">
-        <p class="hint">Blank forecasts tomorrow</p>
       </div>
       <div class="field"><button id="go">Forecast</button></div>
     </div>
@@ -336,7 +333,6 @@ async function run() {{
     return;
   }}
   const body = {{ node: node }};
-  if ($("date").value) body.target_date = $("date").value;
 
   // A node whose stored prices stopped short is filled from CENACE
   // before it can be forecast, and a free instance may also be waking
@@ -402,7 +398,8 @@ async function run() {{
   const cheap = data.cheapest_window;
 
   $("status").textContent =
-    `Issued ${{data.issued_at}}, using prices through ${{data.history_end}}.` +
+    `Forecast for ${{data.target_date}}, issued ${{data.issued_at}} from ` +
+    `prices through ${{data.history_end}}.` +
     (data.backtest ? " Backtest: this date is already published." : "") +
     (data.evaluated_node
       ? ""

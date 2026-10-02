@@ -17,7 +17,7 @@ tomorrow, before offers close and before CENACE publishes the price.**
 | Morning | **PMLcast forecasts tomorrow's 24 prices**, from prices already public |
 | Until 10:00 | Market participants send their offers for tomorrow, without knowing the price |
 | 10:00 | Offers close |
-| Around 18:45 | CENACE publishes tomorrow's prices |
+| Around 18:45 | CENACE publishes tomorrow's prices; PMLcast moves on to the day after |
 
 The forecast is useful in the window before 10:00. Once CENACE publishes,
 the real prices are known and the forecast is only scored against them.
@@ -196,10 +196,15 @@ curl -X POST https://pmlcast.onrender.com/forecast \
   -d '{"node": "01PIT-400"}'
 ```
 
-`target_date` is optional and defaults to tomorrow. A past date replays
-what the service would have seen that morning. More than one day ahead is
-rejected: this is a single-horizon model. `evaluated_node` in the response
-says whether the node is one of the 99 the reported error describes — the
+Without `target_date` the service forecasts the day after the last one
+CENACE has published for that node: tomorrow during the day, the day after
+once CENACE publishes tomorrow, around 18:45. That is the only day a
+forecast is still news for, so the dashboard has no date field. A past
+`target_date` replays what the service would have seen that morning
+(`backtest: true`); a day whose previous day is not published yet is
+rejected, because this is a single-horizon model.
+
+`evaluated_node` in the response says whether the node is one of the 99 the reported error describes — the
 service answers for any of the ~2,444 SIN nodes, but the metrics were
 measured on the evaluation set.
 

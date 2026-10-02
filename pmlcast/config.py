@@ -58,9 +58,14 @@ OBSERVED_QUALITIES = ("ok", "dst_fill", "dst_merge")
 SEED = 0
 
 
+def now_local():
+    """Return the current time in the CENACE system time zone."""
+    return datetime.datetime.now(zoneinfo.ZoneInfo(TZ_NAME))
+
+
 def today_local():
     """Return today's date in the CENACE system time zone."""
-    return datetime.datetime.now(zoneinfo.ZoneInfo(TZ_NAME)).date()
+    return now_local().date()
 
 
 def setup_logging(log_file=None, level=logging.INFO):

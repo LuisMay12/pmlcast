@@ -5,6 +5,7 @@ import datetime
 import json
 import logging
 import os
+import time
 
 import numpy as np
 import onnxruntime as ort
@@ -30,6 +31,11 @@ DEFAULT_EVALUATED = os.path.join(config.SNAPSHOT_DIR, "nodes_stage2.csv")
 ISSUE_HOUR = 6
 # Quality of the placeholder target day added before CENACE publishes it.
 PENDING_QUALITY = "pending"
+# CENACE stamps the next day's MDA file around 18:45, so asking for
+# tomorrow earlier than this is a wasted request.
+PUBLISH_HOUR = 18
+# How long an unanswered request for a day is trusted before asking again.
+RETRY_S = 600
 TOP_HOURS = 4
 CHEAP_HOURS = 4
 
@@ -70,6 +76,7 @@ class Forecaster:
         self.silver_dir = silver_dir
         self.backfill = backfill
         self.bronze_dir = bronze_dir
+        self._asked = {}
         self.input_days = self.meta["input_hours"] // 24
         self.market = self.meta.get("market", "MDA")
         self.model_version = "{}@{}".format(
@@ -149,8 +156,7 @@ class Forecaster:
         every day, and asking for the few missing days costs a wait rather
         than an error.
         """
-        needed = max(self.input_days, config.STATS_DAYS) + 1
-        start = origin - datetime.timedelta(days=needed)
+        start = origin - datetime.timedelta(days=self._needed_days())
         end = origin + datetime.timedelta(days=1)
         history = self._read_history(node, start, end)
         if self.backfill and self._missing_tail(history, origin):
@@ -164,6 +170,60 @@ class Forecaster:
             )
 
         return self._with_target_day(history, node, origin)
+
+    def next_target(self, node):
+        """Return the furthest day this node can be forecast for now.
+
+        That is the day after the last one CENACE has published. In the
+        morning it is tomorrow; once CENACE publishes tomorrow, in the
+        evening, it becomes the day after. A default that is already
+        published would be a backtest, so a node whose prices stop
+        before today is refused instead.
+        """
+        today = config.today_local()
+        tomorrow = today + datetime.timedelta(days=1)
+        newest = tomorrow if config.now_local().hour >= PUBLISH_HOUR else today
+        start = today - datetime.timedelta(days=self._needed_days())
+        last = self._stored_last_day(node, start, tomorrow)
+        if (
+            self.backfill
+            and (last is None or last < newest)
+            and self._may_ask(node, newest)
+        ):
+            self.fetch_missing(node, start, newest)
+            last = self._stored_last_day(node, start, tomorrow)
+        if last is None or last < today:
+            raise ForecastError(
+                "published history for node {} ends at {}, so tomorrow "
+                "cannot be forecast yet: the model needs today's prices "
+                "({})".format(node, last or "no recent day", today)
+            )
+
+        return last + datetime.timedelta(days=1)
+
+    def _needed_days(self):
+        """Days of history before the origin a sample needs."""
+        return max(self.input_days, config.STATS_DAYS) + 1
+
+    def _stored_last_day(self, node, start, end):
+        """Return the last day silver holds for a node, or None."""
+        history = self._read_history(node, start, end)
+        return None if history.empty else self._last_day(history)
+
+    def _may_ask(self, node, day):
+        """Say whether CENACE may be asked for a day, at most every RETRY_S.
+
+        Between PUBLISH_HOUR and the moment CENACE actually publishes,
+        every request would otherwise wait on a call that returns
+        nothing new.
+        """
+        now = time.monotonic()
+        asked = self._asked.get((node, day))
+        if asked is not None and now - asked < RETRY_S:
+            return False
+        self._asked[(node, day)] = now
+
+        return True
 
     def _read_history(self, node, start, end):
         """Read one node's silver rows over a date range."""
@@ -315,21 +375,26 @@ class Forecaster:
 
         Args:
             node: Node key from the CENACE catalog.
-            target_date: Day to forecast; tomorrow when omitted.
+            target_date: Day to forecast. When omitted, the day after
+                the last one CENACE has published; a past date replays
+                the forecast as a backtest.
 
         Returns:
             Dict with the prices, the injection windows and the metadata
             a caller needs to judge the forecast.
         """
         today = config.today_local()
-        target_date = target_date or today + datetime.timedelta(days=1)
-        if target_date > today + datetime.timedelta(days=1):
+        # CENACE publishes at most tomorrow, so nothing past the day
+        # after can have its origin published. Refused before any work.
+        if target_date and target_date > today + datetime.timedelta(days=2):
             raise ForecastError(
-                "PMLcast is a single-horizon model: it forecasts at most "
-                "one day ahead, so {} is out of range".format(target_date)
+                "PMLcast is a single-horizon model: it forecasts the day "
+                "after the last one CENACE has published, so {} is out "
+                "of range".format(target_date)
             )
 
         self.check_scope(node)
+        target_date = target_date or self.next_target(node)
         arrays, index, position = self.build_sample(node, target_date)
         row = index.iloc[position]
         inputs = {
@@ -344,9 +409,18 @@ class Forecaster:
         )[0]
 
         origin = row["origin_date"]
-        issued_at = datetime.datetime.combine(
-            origin + datetime.timedelta(days=1), datetime.time(ISSUE_HOUR)
+        backtest = (
+            self._stored_last_day(node, target_date, target_date) is not None
         )
+        # A live forecast is issued now. A backtest replays the forecast
+        # as the product issues it, the morning of the origin day, which
+        # is also the time the baselines are stamped with.
+        if backtest:
+            issued_at = datetime.datetime.combine(
+                origin, datetime.time(ISSUE_HOUR)
+            )
+        else:
+            issued_at = config.now_local().replace(tzinfo=None, microsecond=0)
 
         return {
             "node": node,
@@ -365,7 +439,7 @@ class Forecaster:
             ),
             "cheapest_window": window_of(prices, CHEAP_HOURS, expensive=False),
             "model_version": self.model_version,
-            "backtest": target_date <= today,
+            "backtest": backtest,
             "evaluated_node": node in self.evaluated,
         }
 
