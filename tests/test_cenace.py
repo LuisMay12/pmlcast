@@ -213,3 +213,60 @@ def test_collect_end_to_end(tmp_path):
     assert fifth["n_fetched"] == 1 and fifth["n_ok"] == 1
     frame = storage.read_silver(silver, "MDA", nodes=["07PNC-115"])
     assert frame["fecha"].max() == extra_end
+
+
+def test_collect_fresh_refetches_a_window_published_later(tmp_path):
+    """A window asked for before CENACE published all its days is asked again.
+
+    The bulk collector trusts bronze, so a partly published window counts
+    as done. The service backfill passes ``fresh`` and plans from silver,
+    so the days published afterwards are fetched.
+    """
+    bronze = str(tmp_path / "bronze")
+    silver = str(tmp_path / "silver")
+    node = "07PNC-115"
+    windows = cenace.epoch_windows("MDA", D(2024, 3, 2), D(2024, 3, 15))
+    win_start, win_end = windows[1]  # one full, anchored 7-day window
+
+    partial = {node: make_records(win_start, 3, seed=1)}  # 3 of 7 days out
+    cenace.collect(
+        [node],
+        "SIN",
+        "MDA",
+        win_start,
+        win_end,
+        bronze,
+        silver,
+        session=FakeSession([("ok", cenace_payload(partial))]),
+        sleep=lambda _: None,
+    )
+    trusted = cenace.collect(
+        [node],
+        "SIN",
+        "MDA",
+        win_start,
+        win_end,
+        bronze,
+        silver,
+        session=FakeSession([]),
+        sleep=lambda _: None,
+    )
+    assert trusted["n_planned"] == 0  # bronze says the window is done
+
+    full = {node: make_records(win_start, 7, seed=1)}
+    session = FakeSession([("ok", cenace_payload(full))])
+    fresh = cenace.collect(
+        [node],
+        "SIN",
+        "MDA",
+        win_start,
+        win_end,
+        bronze,
+        silver,
+        session=session,
+        sleep=lambda _: None,
+        fresh=True,
+    )
+    assert fresh["n_fetched"] == 1 and len(session.calls) == 1
+    days = storage.read_silver(silver, "MDA", nodes=[node])["fecha"]
+    assert days.nunique() == 7

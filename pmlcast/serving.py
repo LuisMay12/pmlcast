@@ -5,6 +5,7 @@ import datetime
 import json
 import logging
 import os
+import time
 
 import numpy as np
 import onnxruntime as ort
@@ -28,6 +29,13 @@ KERAS_MODEL = os.path.join(MODELS_DIR, "lstm_history_final.keras")
 DEFAULT_META = os.path.join(config.GOLD_DIR, "dataset_final", "meta.json")
 DEFAULT_EVALUATED = os.path.join(config.SNAPSHOT_DIR, "nodes_stage2.csv")
 ISSUE_HOUR = 6
+# Quality of the placeholder target day added before CENACE publishes it.
+PENDING_QUALITY = "pending"
+# CENACE stamps the next day's MDA file around 18:45, so asking for
+# tomorrow earlier than this is a wasted request.
+PUBLISH_HOUR = 18
+# How long an unanswered request for a day is trusted before asking again.
+RETRY_S = 600
 TOP_HOURS = 4
 CHEAP_HOURS = 4
 
@@ -68,6 +76,7 @@ class Forecaster:
         self.silver_dir = silver_dir
         self.backfill = backfill
         self.bronze_dir = bronze_dir
+        self._asked = {}
         self.input_days = self.meta["input_hours"] // 24
         self.market = self.meta.get("market", "MDA")
         self.model_version = "{}@{}".format(
@@ -136,20 +145,22 @@ class Forecaster:
         The window the model sees ends at 23:00 of the origin, but the
         sample builder pairs each origin with its target day, so the
         target has to be present in the frame for the pair to exist. Its
-        prices are the label, never an input: for a future target they
-        are NaN and the sample is still built.
+        prices are the label, never an input. Before CENACE publishes the
+        target day, which it does around 18:45 the evening before, that
+        day is not in silver at all, so an empty placeholder day is added
+        in its place: forecasting tomorrow in the morning is the point of
+        the product.
 
-        With ``backfill`` on, a gap at the recent end is filled from
-        CENACE before giving up: a packaged demo goes stale every day,
-        and asking for the few missing days costs a wait rather than an
-        error.
+        With ``backfill`` on, a gap at the recent end of the inputs is
+        filled from CENACE before giving up: a packaged demo goes stale
+        every day, and asking for the few missing days costs a wait rather
+        than an error.
         """
-        needed = max(self.input_days, config.STATS_DAYS) + 1
-        start = origin - datetime.timedelta(days=needed)
+        start = origin - datetime.timedelta(days=self._needed_days())
         end = origin + datetime.timedelta(days=1)
         history = self._read_history(node, start, end)
-        if self.backfill and self._missing_tail(history, start, end):
-            self.fetch_missing(node, start, end)
+        if self.backfill and self._missing_tail(history, origin):
+            self.fetch_missing(node, start, origin)
             history = self._read_history(node, start, end)
         if history.empty:
             raise ForecastError(
@@ -158,7 +169,61 @@ class Forecaster:
                 )
             )
 
-        return history
+        return self._with_target_day(history, node, origin)
+
+    def next_target(self, node):
+        """Return the furthest day this node can be forecast for now.
+
+        That is the day after the last one CENACE has published. In the
+        morning it is tomorrow; once CENACE publishes tomorrow, in the
+        evening, it becomes the day after. A default that is already
+        published would be a backtest, so a node whose prices stop
+        before today is refused instead.
+        """
+        today = config.today_local()
+        tomorrow = today + datetime.timedelta(days=1)
+        newest = tomorrow if config.now_local().hour >= PUBLISH_HOUR else today
+        start = today - datetime.timedelta(days=self._needed_days())
+        last = self._stored_last_day(node, start, tomorrow)
+        if (
+            self.backfill
+            and (last is None or last < newest)
+            and self._may_ask(node, newest)
+        ):
+            self.fetch_missing(node, start, newest)
+            last = self._stored_last_day(node, start, tomorrow)
+        if last is None or last < today:
+            raise ForecastError(
+                "published history for node {} ends at {}, so tomorrow "
+                "cannot be forecast yet: the model needs today's prices "
+                "({})".format(node, last or "no recent day", today)
+            )
+
+        return last + datetime.timedelta(days=1)
+
+    def _needed_days(self):
+        """Days of history before the origin a sample needs."""
+        return max(self.input_days, config.STATS_DAYS) + 1
+
+    def _stored_last_day(self, node, start, end):
+        """Return the last day silver holds for a node, or None."""
+        history = self._read_history(node, start, end)
+        return None if history.empty else self._last_day(history)
+
+    def _may_ask(self, node, day):
+        """Say whether CENACE may be asked for a day, at most every RETRY_S.
+
+        Between PUBLISH_HOUR and the moment CENACE actually publishes,
+        every request would otherwise wait on a call that returns
+        nothing new.
+        """
+        now = time.monotonic()
+        asked = self._asked.get((node, day))
+        if asked is not None and now - asked < RETRY_S:
+            return False
+        self._asked[(node, day)] = now
+
+        return True
 
     def _read_history(self, node, start, end):
         """Read one node's silver rows over a date range."""
@@ -166,23 +231,60 @@ class Forecaster:
             self.silver_dir, self.market, nodes=[node], start=start, end=end
         )
 
-    def _missing_tail(self, history, start, end):
-        """Say whether the window is short of days at its recent end.
-
-        Only the tail matters: CENACE publishes day by day, so a hole in
-        the middle is a genuine gap, while a short tail is just a
-        snapshot that stopped being current. The end of the window is
-        the target day, whose row has to exist for the sample builder to
-        pair it with its origin, even while its prices are still NaN.
-        """
-        if history.empty:
-            return True
-
+    @staticmethod
+    def _last_day(history):
+        """Return the last operation day in a frame, as a date."""
         last = history["fecha"].max()
         if isinstance(last, pd.Timestamp):
             last = last.date()
 
-        return last < end
+        return last
+
+    def _missing_tail(self, history, origin):
+        """Say whether the inputs are short of days at their recent end.
+
+        Only the tail matters: CENACE publishes day by day, so a hole in
+        the middle is a genuine gap, while a short tail is just a
+        snapshot that stopped being current. The inputs end at the
+        origin; the target day is never needed from CENACE.
+        """
+        if history.empty:
+            return True
+
+        return self._last_day(history) < origin
+
+    def _with_target_day(self, history, node, origin):
+        """Append an empty target day when CENACE has not published it.
+
+        The placeholder carries the calendar of the target day and NaN
+        prices, marked ``pending`` so the sample builder does not mistake
+        it for a missing day. It is only added right after a complete
+        origin day: a gap earlier than that is real and has to surface
+        as the ordinary not-enough-history error.
+        """
+        target = origin + datetime.timedelta(days=1)
+        if (history["fecha"] == target).any():
+            return history
+        if self._last_day(history) != origin:
+            return history
+
+        stamps = pd.date_range(
+            pd.Timestamp(target), periods=config.TARGET_HOURS, freq="h"
+        )
+        filler = pd.DataFrame(
+            {
+                "node": node,
+                "market": self.market,
+                "sistema": history["sistema"].iloc[-1],
+                "ts_local": stamps,
+                "fecha": target,
+                "hora": range(1, config.TARGET_HOURS + 1),
+                "quality": PENDING_QUALITY,
+            }
+        )
+        # Prices and the ingestion fields are left out on purpose: concat
+        # fills them with NaN, which is exactly what an unpublished day is.
+        return pd.concat([history, filler], ignore_index=True)
 
     def fetch_missing(self, node, start, end):
         """Ask CENACE for the days this node is missing, and ignore failures.
@@ -190,7 +292,9 @@ class Forecaster:
         A backfill is a convenience, not a contract: when the upstream
         service is down or slow the forecast should still be attempted
         with whatever is already stored, and fail with the ordinary
-        not-enough-history message if that is not enough.
+        not-enough-history message if that is not enough. It plans from
+        what silver holds, not from earlier requests, so days CENACE
+        published after a window was first asked for are fetched too.
         """
         row = self.node_row(node)
         sistema = row["sistema"] if row is not None else "SIN"
@@ -203,6 +307,7 @@ class Forecaster:
                 end,
                 self.bronze_dir,
                 self.silver_dir,
+                fresh=True,
             )
         except Exception:  # noqa: BLE001 - upstream is best-effort here
             logging.getLogger("pmlcast").warning(
@@ -270,21 +375,26 @@ class Forecaster:
 
         Args:
             node: Node key from the CENACE catalog.
-            target_date: Day to forecast; tomorrow when omitted.
+            target_date: Day to forecast. When omitted, the day after
+                the last one CENACE has published; a past date replays
+                the forecast as a backtest.
 
         Returns:
             Dict with the prices, the injection windows and the metadata
             a caller needs to judge the forecast.
         """
         today = config.today_local()
-        target_date = target_date or today + datetime.timedelta(days=1)
-        if target_date > today + datetime.timedelta(days=1):
+        # CENACE publishes at most tomorrow, so nothing past the day
+        # after can have its origin published. Refused before any work.
+        if target_date and target_date > today + datetime.timedelta(days=2):
             raise ForecastError(
-                "PMLcast is a single-horizon model: it forecasts at most "
-                "one day ahead, so {} is out of range".format(target_date)
+                "PMLcast is a single-horizon model: it forecasts the day "
+                "after the last one CENACE has published, so {} is out "
+                "of range".format(target_date)
             )
 
         self.check_scope(node)
+        target_date = target_date or self.next_target(node)
         arrays, index, position = self.build_sample(node, target_date)
         row = index.iloc[position]
         inputs = {
@@ -299,9 +409,18 @@ class Forecaster:
         )[0]
 
         origin = row["origin_date"]
-        issued_at = datetime.datetime.combine(
-            origin + datetime.timedelta(days=1), datetime.time(ISSUE_HOUR)
+        backtest = (
+            self._stored_last_day(node, target_date, target_date) is not None
         )
+        # A live forecast is issued now. A backtest replays the forecast
+        # as the product issues it, the morning of the origin day, which
+        # is also the time the baselines are stamped with.
+        if backtest:
+            issued_at = datetime.datetime.combine(
+                origin, datetime.time(ISSUE_HOUR)
+            )
+        else:
+            issued_at = config.now_local().replace(tzinfo=None, microsecond=0)
 
         return {
             "node": node,
@@ -320,7 +439,7 @@ class Forecaster:
             ),
             "cheapest_window": window_of(prices, CHEAP_HOURS, expensive=False),
             "model_version": self.model_version,
-            "backtest": target_date <= today,
+            "backtest": backtest,
             "evaluated_node": node in self.evaluated,
         }
 

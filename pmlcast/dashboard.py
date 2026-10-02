@@ -2,8 +2,10 @@
 """Render the dashboard page and the data it needs."""
 
 import datetime
+import glob
 import json
 import os
+import time
 
 import pandas as pd
 
@@ -69,13 +71,37 @@ def latest_scored(gold_dir, node=None):
     }
 
 
-def data_freshness(silver_dir, market="MDA"):
-    """Return the last operation day present in silver."""
-    table = storage.coverage_table(silver_dir, market)
-    if table.empty:
-        return None
+FRESHNESS_TTL_S = 300
+_freshness_cache = {}
 
-    return str(table["last"].max())
+
+def data_freshness(silver_dir, market="MDA"):
+    """Return the last operation day present in silver.
+
+    Only the date column is read, and the answer is kept for a few minutes.
+    The full coverage table loads every price row, about 175 MB on the demo
+    slice, and building it on each page load ran a 512 MB instance out of
+    memory as soon as two visitors opened the page together.
+    """
+    key = (silver_dir, market)
+    now = time.monotonic()
+    cached = _freshness_cache.get(key)
+    if cached and now - cached[0] < FRESHNESS_TTL_S:
+        return cached[1]
+
+    pattern = os.path.join(
+        silver_dir, "market={}".format(market), "node=*.parquet"
+    )
+    last = None
+    for path in glob.glob(pattern):
+        day = pd.read_parquet(path, columns=["fecha"])["fecha"].max()
+        if pd.notna(day) and (last is None or day > last):
+            last = day
+
+    value = None if last is None else str(last)
+    _freshness_cache[key] = (now, value)
+
+    return value
 
 
 def recent_skill(gold_dir, days=30):
@@ -144,9 +170,11 @@ PAGE = """<!doctype html>
          padding: 20px; margin-bottom: 18px; }}
  .card h3 {{ margin: 0 0 14px; font-size: 15px; }}
 
- /* The picker: a labelled field group rather than three loose inputs. */
+ /* The picker: a labelled field and its button. There is no date: the
+    service forecasts the day after the last one CENACE has published,
+    the only day a forecast is still news for. */
  .picker {{ display: grid; gap: 14px;
-           grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr) auto;
+           grid-template-columns: minmax(0, 1fr) auto;
            align-items: end; }}
  @media (max-width: 680px) {{ .picker {{ grid-template-columns: 1fr; }} }}
  .field label {{ display: block; font-size: 11px; font-weight: 600;
@@ -205,11 +233,6 @@ PAGE = """<!doctype html>
                placeholder="Type a node key, or pick one">
         <datalist id="nodelist"></datalist>
         <p class="hint" id="nodehint"></p>
-      </div>
-      <div class="field">
-        <label for="date">Target date</label>
-        <input type="date" id="date">
-        <p class="hint">Blank forecasts tomorrow</p>
       </div>
       <div class="field"><button id="go">Forecast</button></div>
     </div>
@@ -310,7 +333,6 @@ async function run() {{
     return;
   }}
   const body = {{ node: node }};
-  if ($("date").value) body.target_date = $("date").value;
 
   // A node whose stored prices stopped short is filled from CENACE
   // before it can be forecast, and a free instance may also be waking
@@ -376,7 +398,8 @@ async function run() {{
   const cheap = data.cheapest_window;
 
   $("status").textContent =
-    `Issued ${{data.issued_at}}, using prices through ${{data.history_end}}.` +
+    `Forecast for ${{data.target_date}}, issued ${{data.issued_at}} from ` +
+    `prices through ${{data.history_end}}.` +
     (data.backtest ? " Backtest: this date is already published." : "") +
     (data.evaluated_node
       ? ""

@@ -12,3 +12,4 @@ tabulate
 fastapi
 uvicorn
 onnxruntime
+tf2onnx

@@ -100,3 +100,51 @@ def test_missing_model_is_reported_clearly(tmp_path):
     with pytest.raises(serving.ForecastError) as error:
         serving.Forecaster(model_path=str(tmp_path / "nope.keras"))
     assert "model not found" in str(error.value)
+
+
+def _one_day(day, node="08MDP-230"):
+    """Return 24 published silver-like rows of one node and day."""
+    return pd.DataFrame(
+        {
+            "node": node,
+            "market": "MDA",
+            "sistema": "SIN",
+            "ts_local": pd.date_range(pd.Timestamp(day), periods=24, freq="h"),
+            "fecha": day,
+            "hora": range(1, 25),
+            "pml": 1000.0,
+            "pml_ene": 900.0,
+            "pml_per": 80.0,
+            "pml_cng": 20.0,
+            "quality": "ok",
+        }
+    )
+
+
+def test_unpublished_target_day_gets_a_placeholder():
+    """Tomorrow can be forecast before CENACE publishes it."""
+    forecaster = FakeForecaster(pd.DataFrame(columns=["node", "sistema"]))
+    origin = datetime.date(2026, 10, 1)
+    out = forecaster._with_target_day(_one_day(origin), "08MDP-230", origin)
+
+    target = out[out["fecha"] == origin + datetime.timedelta(days=1)]
+    assert len(out) == 48 and len(target) == 24
+    assert (target["quality"] == serving.PENDING_QUALITY).all()
+    assert target["pml"].isna().all()
+    assert list(target["ts_local"].dt.hour) == list(range(24))
+
+
+def test_placeholder_is_not_added_over_real_data_or_a_gap():
+    """Published targets are kept, and a gap before the origin is left."""
+    forecaster = FakeForecaster(pd.DataFrame(columns=["node", "sistema"]))
+    origin = datetime.date(2026, 10, 1)
+    published = pd.concat(
+        [_one_day(origin), _one_day(origin + datetime.timedelta(days=1))],
+        ignore_index=True,
+    )
+    same = forecaster._with_target_day(published, "08MDP-230", origin)
+    assert len(same) == 48 and not same["pml"].isna().any()
+
+    stale = _one_day(origin - datetime.timedelta(days=2))
+    kept = forecaster._with_target_day(stale, "08MDP-230", origin)
+    assert len(kept) == 24
